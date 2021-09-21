@@ -1,0 +1,9 @@
+# Git
+.git/
+
+# Python
+*__pycache__/
+
+# Project
+data/*
+models/*
