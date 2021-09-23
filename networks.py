@@ -2,9 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
-import timm
+from efficientnet_pytorch import EfficientNet
+from efficientnet_pytorch.utils import Conv2dStaticSamePadding
 
-# "variables": "#abb1bd"
+
+__all__ = ['ResNet18_Extractor', 'DeiT_Extractor', 'EfficientNet_Extractor']
+
 
 class AMSoftmaxLoss(nn.Module):
     def __init__(self, in_features, out_features, s=30.0, m=0.4):
@@ -51,7 +54,7 @@ class BaseExtractor(nn.Module):
         self.fc = nn.Linear(1000, embed_size)
         self.emb_extractor = AMSoftmaxLoss(in_features=embed_size, out_features=num_classes)
 
-    def forward(self, x, labels=None, return_type='emb'):
+    def forward(self, x, labels=None, return_type='loss'):
         x = F.dropout(F.leaky_relu(self.model(x), 0.2, True), 0.3)
         x = self.fc(x)
         if return_type == 'emb': out = x
@@ -98,20 +101,16 @@ class ResNet18_Extractor(BaseExtractor):
     def __init__(self, input_shape, num_classes, embed_size):
         super(ResNet18_Extractor, self).__init__(input_shape, num_classes, embed_size)
         self.model = torchvision.models.resnet18(pretrained=True)
-        self.model.conv1 = nn.Conv2d(input_shape[0], 64, 7, 2, 3, bias=False)
+        # self.model.conv1 = nn.Conv2d(input_shape[0], 64, 7, 2, 3, bias=False)
 
 
-#class CeiT_Extractor(BaseExtractor):
-#    """ ~7.8M params, """
-#    def __init__(self, input_shape, num_classes, embed_size):
-#        super(CeiT_Extractor, self).__init__(input_shape, num_classes, embed_size)
-#        self.model = torch.hub.load('models/ceit_tiny_patch16_224_epochs300', 'ceit_tiny_patch16_224', pretrained=True)
-#        self.model.patch_embed.proj = nn.Conv2d(input_shape[0], 192, 16, 16)
+class EfficientNet_Extractor(BaseExtractor):
+    """ ~43M params, 86% Top-1% in ImageNet """
+    def __init__(self, input_shape, num_classes, embed_size, effnet_type='b6'):
+        super(EfficientNet_Extractor, self).__init__(input_shape, num_classes, embed_size)
+        self.model = EfficientNet.from_pretrained('efficientnet-%s' % effnet_type)
 
 
-#class CaiT_Extractor(BaseExtractor):
-#    """ ~7.8M params """
-#    def __init__(self, input_shape, num_classes, embed_size):
-#        super(CaiT_Extractor, self).__init__(input_shape, num_classes, embed_size)
-#        self.model = torch.hub.load('facebookresearch/deit:main', 'deit_tiny_patch16_224', pretrained=True)
-#        self.model.patch_embed.proj = nn.Conv2d(input_shape[0], 192, 16, 16)
+if __name__ == '__main__':
+    model = EfficientNet_Extractor(input_shape=[3, 172, 64], num_classes=31, embed_size=256, effnet_type='b6')
+    model.to('cuda:0')

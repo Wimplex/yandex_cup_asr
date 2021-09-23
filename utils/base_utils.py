@@ -1,5 +1,6 @@
+import os
+import glob
 import numpy as np
-from numpy.lib.stride_tricks import DummyArray
 import torch
 import torchaudio
 
@@ -44,3 +45,12 @@ def measure_inference_timings(model, dummy_tensor, reps=300, device='cuda:0'):
     fps = 1000 / mean_inference_time
     return mean_inference_time, fps
 
+
+def traverse_dir_list(dir_list):
+    res = []
+    for d in dir_list: res += glob.glob(os.path.join(d, '*.wav'))
+    return res
+
+
+def save_model(model, save_path):
+    torch.save(model.state_dict(), save_path)
