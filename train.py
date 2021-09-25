@@ -1,30 +1,30 @@
-import os
+import warnings 
+warnings.filterwarnings('ignore')
+
 import tqdm
 import random
-import argparse
 
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 import torch
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.utils.data import DataLoader
 
 from config import Config
 from networks import *
-from data import AudioDataset, Preprocessor
-from utils.base_utils import save_model
+from data import AudioDataset
+from base_utils import save_model
 
 
-def evaluate_loss(model, test_loader, preprocessor, device, criterion='model'):
+def evaluate_loss(model, test_loader, device, criterion='model'):
     """ Returns average loss on test set for input model """
-
     losses = []
-    for batch_X, batch_y in test_loader:
+    for batch_X, batch_y, _ in test_loader:
         batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-        batch_X = preprocessor(batch_X)
-        if criterion == 'model': loss = model(batch_X, batch_y)
+        if criterion == 'model': loss = model.forward_loss(batch_X, batch_y)
         else:
             output_batch = model(batch_X)
             loss = criterion(output_batch, batch_y)
@@ -32,67 +32,106 @@ def evaluate_loss(model, test_loader, preprocessor, device, criterion='model'):
     return np.mean(losses)
         
 
-def predict_classifier(model, preprocessor, data_loader, device):
+def predict_classifier(model, data_loader, device):
     """ Returns predictions from classifier model """
-
     is_model_in_train_mode = model.training
     model = model.to(device)
     if is_model_in_train_mode: model.eval()
     with torch.no_grad():
         pred, true = torch.Tensor().to(device), torch.Tensor().to(device)
-        for batch_X, batch_y in data_loader:
+        names = []
+        for batch_X, batch_y, batch_name in tqdm.tqdm(data_loader, total=len(data_loader)):
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            batch_X = preprocessor(batch_X)
             batch_out = model(batch_X)
             pred = torch.cat([pred, batch_out.argmax(axis=1)])
             true = torch.cat([true, batch_y])
+            names += batch_name
     if is_model_in_train_mode: model.train()
-    return pred.cpu(), true.cpu()
+    return pred.cpu().int(), true.cpu(), names
 
 
-def train_extractor(model, preprocessor, train_loader, test_loader, optimizer, scheduler, n_epochs, device, eval_every):
-    preprocessor = preprocessor.to(device)
-    model = model.to(device)
+def train_extractor(model, train_loader, test_loader, \
+                    optimizer, scheduler, n_epochs, eval_every):
+    device = model.device
     model.train()
-    best_loss = 10.0
+    best_loss = 15.0
+    last_train_loss, last_eval_loss = 0, 0
+
+    for ep in range(n_epochs):
+        print("Epoch %s/%s started." % (ep + 1, n_epochs))
+
+        pbar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader))
+        train_loss = []
+        for i, (batch_X, batch_y, _) in pbar:
+            batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+
+            optimizer.zero_grad(set_to_none=True)
+            loss = model.forward_loss(batch_X, batch_y)
+            loss.backward()
+            optimizer.step()
+            train_loss.append(loss.item())
+
+            curr_iter = ep * len(train_loader) + i
+            if curr_iter % 10 == 0:
+                last_train_loss = np.mean(train_loss)
+                
+            if curr_iter % eval_every == 0:
+                last_eval_loss = evaluate_loss(model, test_loader, device)
+                if best_loss > last_eval_loss:
+                    best_loss = last_eval_loss
+                    print('New best loss: %s!' % np.round(best_loss, 4))
+                    save_model(model, 'models/extractor.pth')
+                scheduler.step(last_eval_loss)
+            
+            pbar.set_description("train_loss: %s, eval_loss: %s" % (last_train_loss, last_eval_loss))
+            torch.cuda.empty_cache()
+
+
+def train_classifier(model, train_loader, test_loader, \
+                     optimizer, scheduler, n_epochs, eval_every):
+    device = model.device
+    model.train()
+    last_train_loss, best_acc = 0, 0.0
 
     for ep in range(n_epochs):
         print("Epoch %s/%s started." % (ep + 1, n_epochs))
 
         pbar = tqdm.tqdm(enumerate(train_loader), total=len(train_loader))
         metrics = {'train_loss': [], 'eval_loss': []}
-        for i, (batch_X, batch_y) in pbar:
+        for i, (batch_X, batch_y, _) in pbar:
             batch_X, batch_y = batch_X.to(device), batch_y.to(device)
-            batch_X = preprocessor(batch_X)
-            optimizer.zero_grad()
-            loss = model(batch_X, batch_y)
+            output_batch = model(batch_X)
+            optimizer.zero_grad(set_to_none=True)
+            loss = F.cross_entropy(output_batch, batch_y)
             loss.backward()
             optimizer.step()
             metrics['train_loss'].append(loss.item())
 
             curr_iter = ep * len(train_loader) + i
             if curr_iter % 10 == 0:
-                pbar.set_description("train_loss: %s" % np.mean(metrics['train_loss']))
+                last_train_loss = np.mean(metrics['train_loss'])
+                pbar.set_description("train_loss: %s, best_eval_accuracy: %s" % (last_train_loss, best_acc))
 
-            if curr_iter % eval_every:
-                eval_loss = evaluate_loss(model, test_loader, preprocessor, device)
-                suffix = pbar.suffix
-                pbar.set_description(suffix + ', eval_loss: %s' % eval_loss)
+            if curr_iter % eval_every == 0:
+                pred, true, _ = predict_classifier(model, test_loader, device)
+                acc = accuracy_score(true, pred)
 
-                if eval_loss < best_loss:
-                    print('New best loss')
-                    save_model(model, 'models/ep%s_iter%s_loss%s.pth' % (ep, curr_iter, np.round(eval_loss, 4)))
-        scheduler.step(eval_loss)
-
-
-def train_classifier(model, train_loader, test_loader, optimizer, scheduler, n_epochs, device, eval_every):
-    model.to(device)
-    model.train()
-    pass
+                if acc > best_acc:
+                    print('New best accuracy: %s!' % acc)
+                    best_acc = acc
+                    save_model(model, 'models/classifier.pth')
+                
+                scheduler.step(acc)
+            torch.cuda.empty_cache()
 
 
+def run(train_type, train_loader, test_loader):
+    # Training preparations
+    device = Config.DEVICE
+    print("Training on", device)
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
 
-def main():
     # Setup randomness
     random.seed(Config.SEED)
     np.random.seed(Config.SEED)
@@ -100,63 +139,65 @@ def main():
     torch.cuda.manual_seed(Config.SEED)
     torch.backends.cudnn.deterministic = True
 
-    # Training preparations
-    device = 'cuda:0'
-    torch.cuda.empty_cache()
-
     # Instantiate model
-    net_kwargs = {'input_shape': Config.INPUT_SHAPE, 'num_classes': Config.NUM_CLASSES, 'embed_size': Config.EMB_SIZE}
-    if Config.MODEL.startswith('efficientnet-'):
-        model = EfficientNet_Extractor(effnet_type=Config.MODEL.split('-')[-1], **net_kwargs)
-    else:
-        if Config.MODEL == 'deit': net_cls = DeiT_Extractor
-        elif Config.MODEL == 'resnet18': net_cls = ResNet18_Extractor
-        model = net_cls(**net_kwargs)
-
-    # Split data
-    desc_df = pd.read_csv('desc.csv')
-    train_df, test_df = train_test_split(desc_df, test_size=0.03, stratify=desc_df['label'])
-    print("Train size:", len(train_df))
-    print("Test size:", len(test_df))
-
-    # Create dataloaders
-    train_dataset = AudioDataset(train_df)
-    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
-    test_dataset = AudioDataset(test_df, label2idx=train_dataset.label2idx)
-    test_loader = DataLoader(test_dataset, batch_size=Config.BATCH_SIZE, shuffle=True)
-    
-    # Create preprocessing unit
-    preproc = Preprocessor(
-        feats_type=Config.FEATURE_TYPE, 
-        n_components=Config.N_COMP, 
-        noises_dir='data/noises', 
-        ir_dir='data/ir'
-    )
+    net_kwargs = {
+        'input_shape':        Config.NUM_CHANNELS,
+        'num_classes':        Config.NUM_CLASSES,
+        'embed_size':         Config.EMB_SIZE,
+        'feats_type':         Config.FEATURE_TYPE,
+        'feats_n_components': Config.N_COMP,
+        'apply_db':           False
+    }
+    model = ResNet18_Extractor(**net_kwargs)
+    # model = EfficientNet_Extractor(effnet_type=Config.MODEL.split('-')[-1], **net_kwargs)
+    if train_type == 'classifier':
+        model.load_state_dict(torch.load('models/extractor.pth'))
+        model = AudioClassifier(model)
+    model = model.to(device)
 
     # Define optimizer
-    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE, betas=(1e-4, 0.999))
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=1, factor=0.75, mode='min')
+    optimizer = optim.Adam(model.parameters(), lr=Config.LEARNING_RATE, betas=(1e-3, 0.999))
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, patience=3, factor=0.85, mode='min')
 
-    train_extractor(
-        model, 
-        preprocessor=preproc, 
-        train_loader=train_loader, 
-        test_loader=test_loader, 
-        optimizer=optimizer, 
-        scheduler=scheduler, 
-        n_epochs=Config.NUM_EPOCHS, 
-        device=device,
-        eval_every=100
-    )
+    if train_type == 'extractor':
+        train_extractor(
+            model,
+            train_loader=train_loader, 
+            test_loader=test_loader, 
+            optimizer=optimizer, 
+            scheduler=scheduler, 
+            n_epochs=Config.NUM_EPOCHS_EXTRACTOR, 
+            eval_every=100
+        )
+    elif train_type == 'classifier':
+        train_classifier(
+            model,
+            train_loader=train_loader,
+            test_loader=test_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            n_epochs=Config.NUM_EPOCHS_CLASSIFIER,
+            eval_every=100
+        )
 
 
 if __name__ == '__main__':
-    main()
+    # Create dataloaders
+    desc_df = pd.read_csv('desc/desc_train.csv')
+    train_dataset, test_dataset = AudioDataset(desc_df, noises_dir=Config.DATA_DIR + 'noises', 
+                                            ir_dir='data/ir').split_dataset(train_size=0.97)
+    train_loader = DataLoader(train_dataset, batch_size=Config.BATCH_SIZE, 
+                            shuffle=True, num_workers=2, pin_memory=True)
+    test_loader = DataLoader(test_dataset, batch_size=32, shuffle=True)
+    print("Train size (num of tensors):", len(train_dataset))
+    print("Test size (num of tensors):", len(test_dataset))
 
+    # Run extractor training
+    run('extractor', train_loader, test_loader)
+
+    # Run classifier training
+    run('classifier', train_loader, test_loader)
 
 # TODO "Что не забыть на соревновании":
-#   - Понять, как организованы описательные данные (например, description.csv) в предоставленном датасете
 #   - Поиграться с аргументом normalize у torchaudio.load() (лежит в utils.py)
-#   - Проверить количество всех лейблов в данных
-#   - Применить one-hot-кодирование к лейблам.
 #   - Посчитать максимальную длительность речи на незашумленных данных

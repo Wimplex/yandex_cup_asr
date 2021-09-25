@@ -2,11 +2,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import torchaudio.transforms as T
+from torch_audiomentations import Compose
 from efficientnet_pytorch import EfficientNet
-from efficientnet_pytorch.utils import Conv2dStaticSamePadding
+
+from config import Config
 
 
-__all__ = ['ResNet18_Extractor', 'DeiT_Extractor', 'EfficientNet_Extractor']
+__all__ = ['ResNet18_Extractor', 'DeiT_Extractor', 'EfficientNet_Extractor', 'AudioClassifier']
+
+
+class Preprocessor(nn.Module):
+    def __init__(self, feats_type, n_components, to_db=False):
+        super(Preprocessor, self).__init__()
+        """
+        Implements data augmentation and feature extraction logic
+        :param str feats_type ['mels' | 'mfcc']:    features type
+        :param str noises_dir:                      path to directory with noise .wav-files
+        :param str ir_dir:                          path to directory with impulse response .wav-files
+        :param bool to_db:                          organizes amplitude-to-db conversion
+        """
+        if feats_type == 'mels':
+            self.features_ext = Compose([
+                T.MelSpectrogram(
+                    Config.SAMPLE_RATE, n_fft=Config.N_FFT, hop_length=Config.HOP_LEN, n_mels=n_components, normalized=True),
+                T.AmplitudeToDB() if to_db else nn.Identity()
+            ])
+        elif feats_type == 'mfcc':
+            self.features_ext = Compose([
+                T.MFCC(Config.SAMPLE_RATE, n_mfcc=n_components, melkwargs={'n_fft': Config.N_FFT, 'hop_length': Config.HOP_LEN}),
+                T.SlidingWindowCmn(cmn_window=300, norm_vars=True),
+                T.AmplitudeToDB() if to_db else nn.Identity()
+            ])
+        self.delta_ext = T.ComputeDeltas(win_length=5)
+
+    def forward(self, x):
+        feats = self.features_ext(x)
+        delta = self.delta_ext(feats)
+        delta2 = self.delta_ext(delta)
+        out = torch.cat([feats, delta, delta2], axis=1)
+        return out
 
 
 class AMSoftmaxLoss(nn.Module):
@@ -41,26 +76,34 @@ class AMSoftmaxLoss(nn.Module):
 
 
 class BaseExtractor(nn.Module):
-    def __init__(self, input_shape, num_classes, embed_size):
+    def __init__(self, input_shape, num_classes, embed_size, feats_type, feats_n_components, apply_db):
         """
         :param tuple input_shape:   shape of input tensor
         :param int num_classes:     number of classes to classify
         :param int embed_size:      latent vector size
         """
         super(BaseExtractor, self).__init__()
+        self.preproc = Preprocessor(feats_type, feats_n_components, apply_db)
         self.input_shape = input_shape
         self.num_classes = num_classes
         self.embed_size = embed_size
         self.fc = nn.Linear(1000, embed_size)
         self.emb_extractor = AMSoftmaxLoss(in_features=embed_size, out_features=num_classes)
 
-    def forward(self, x, labels=None, return_type='loss'):
+    def forward_emb(self, x):
+        x = self.preproc(x)
         x = F.dropout(F.leaky_relu(self.model(x), 0.2, True), 0.3)
         x = self.fc(x)
-        if return_type == 'emb': out = x
-        elif return_type == 'loss': out = self.emb_extractor(x, labels)
-        else: out = (x, self.emb_extractor(x, labels))
+        return x
+
+    def forward_loss(self, x, labels):
+        x = self.forward_emb(x)
+        out = self.emb_extractor(x, labels)
         return out
+
+    @property
+    def device(self):
+        return self.fc.weight.device
 
 
 class AudioClassifier(nn.Module):
@@ -83,34 +126,40 @@ class AudioClassifier(nn.Module):
         )
 
     def forward(self, x):
-        emb = self.extractor(x, return_type='emb')
+        emb = self.extractor.forward_emb(x)
         out = self.classification_pipe(emb)
         return out
+
+    @property
+    def device(self):
+        return self.extractor.fc.weight.device
 
 
 class DeiT_Extractor(BaseExtractor):
     """ ~5M params, 76.6 Top-1% on ImageNet """
-    def __init__(self, input_shape, num_classes, embed_size):
-        super(DeiT_Extractor, self).__init__(input_shape, num_classes, embed_size)
+    def __init__(self, **kwargs):
+        super(DeiT_Extractor, self).__init__(**kwargs)
         self.model = torch.hub.load('facebookresearch/deit:main', 'deit_tiny_patch16_224', pretrained=True)
-        self.model.patch_embed.proj = nn.Conv2d(input_shape[0], 192, 16, 16)
+        self.model.patch_embed.proj = nn.Conv2d(kwargs['input_shape'][0], 192, 16, 16)
 
 
 class ResNet18_Extractor(BaseExtractor):
     """ ~12M params, ??? (not even in rank) """
-    def __init__(self, input_shape, num_classes, embed_size):
-        super(ResNet18_Extractor, self).__init__(input_shape, num_classes, embed_size)
+    def __init__(self, **kwargs):
+        super(ResNet18_Extractor, self).__init__(**kwargs)
         self.model = torchvision.models.resnet18(pretrained=True)
         # self.model.conv1 = nn.Conv2d(input_shape[0], 64, 7, 2, 3, bias=False)
 
 
 class EfficientNet_Extractor(BaseExtractor):
     """ ~43M params, 86% Top-1% in ImageNet """
-    def __init__(self, input_shape, num_classes, embed_size, effnet_type='b6'):
-        super(EfficientNet_Extractor, self).__init__(input_shape, num_classes, embed_size)
+    def __init__(self, effnet_type='b6', **kwargs):
+        super(EfficientNet_Extractor, self).__init__(**kwargs)
         self.model = EfficientNet.from_pretrained('efficientnet-%s' % effnet_type)
 
 
 if __name__ == '__main__':
-    model = EfficientNet_Extractor(input_shape=[3, 172, 64], num_classes=31, embed_size=256, effnet_type='b6')
+    model = EfficientNet_Extractor(input_shape=[3, 172, 64], num_classes=31, embed_size=256, \
+                                   effnet_type='b6', feats_type='mels', feats_n_components=32, \
+                                   apply_db_transition=True)
     model.to('cuda:0')

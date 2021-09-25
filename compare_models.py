@@ -2,9 +2,11 @@ import warnings
 warnings.filterwarnings('ignore')
 
 import os
+
 import torch
+
 from networks import DeiT_Extractor, ResNet18_Extractor, AudioClassifier
-from utils.base_utils import count_parameters, measure_inference_timings
+from base_utils import count_parameters, measure_inference_timings
 from config import Config
 
 

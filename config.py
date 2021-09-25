@@ -1,14 +1,15 @@
 
+import torch
+
 class Config:
     # Very obvious comments below
 
     # Common
-    SEED = 42
+    SEED = 3078
+    DEVICE = 'cuda:0' if torch.cuda.is_available() else 'cpu'
 
     # Dir structure
     DATA_DIR = 'data/asr_data/'
-    NOISES_DIR = ['data/asr_data/noises', 'data/noises']
-    IR_DIR = ['data/ir/ir_set1', 'data/ir/ir_set2']
 
     # Data and features preparation params
     SAMPLE_RATE = 16000
@@ -17,14 +18,25 @@ class Config:
     FEATURE_TYPE = 'mels'               # Features type
     N_COMP = 64                         # Number of feature components (n_mels / n_mfccs)
     WIN_SIZE = 10                       # Number of time-domain samples of features per input to model
-    NUM_CLASSES = 38                    # Number of classes (number of available in dataset phrases)
 
     # Model params
-    MODEL = 'resnet18'                  # Model arch name [deit / resnet18]
+    # MODEL = 'efficientnet-b2'         # Model arch name [deit / resnet18]
+    MODEL = 'resnet18'
     EMB_SIZE = 256                      # Embedding size
-    INPUT_SHAPE = [6, WIN_SIZE, N_COMP] # Shape of input tensors
+    NUM_CHANNELS = 3                    # Count of input channels
 
     # Training params
-    BATCH_SIZE = 16
-    NUM_EPOCHS = 20
+    BATCH_SIZE = 128
+    NUM_EPOCHS_EXTRACTOR = 13
+    NUM_EPOCHS_CLASSIFIER = 8
     LEARNING_RATE = 1e-3
+
+    CLASSES_MAP = ['дальше', 'вперед', 'назад', 'вверх', 'вниз', 
+                   'выше', 'ниже', 'домой', 'громче', 'тише', 
+                   'лайк', 'дизлайк', 'следующий', 'предыдущий',
+                   'сначала', 'перемотай', 'выключи', 'стоп', 'хватит',
+                   'замолчи', 'заткнись', 'останови', 'пауза', 'включи',
+                   'смотреть', 'продолжи', 'играй', 'запусти', 'ноль',
+                   'один', 'два', 'три', 'четыре', 'пять', 'шесть',
+                   'семь', 'восемь', 'девять']
+    NUM_CLASSES = len(CLASSES_MAP)      # Number of classes (number of available in dataset phrases)
