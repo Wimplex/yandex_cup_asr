@@ -6,6 +6,9 @@
 
 # Project
 data/*
+desc/*
 models/*
 img/*
+submissions/*
 temp/*
+temp.py
